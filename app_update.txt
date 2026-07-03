@@ -1,0 +1,246 @@
+import os
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+st.set_page_config(page_title="Smart Data Analyzer", page_icon="📊", layout="wide")
+st.title("📊 Smart Data Analyzer")
+st.write("Upload a CSV file and get instant charts, data quality checks, and AI insights.")
+
+@st.cache_data
+def load_csv(file) -> pd.DataFrame:
+    return pd.read_csv(file)
+
+@st.cache_data
+def preprocess_data(df: pd.DataFrame):
+    df = df.copy()
+    df.columns = df.columns.str.strip()
+
+    datetime_columns = []
+    for col in df.select_dtypes(include="object").columns:
+        parsed = pd.to_datetime(df[col], errors="coerce", infer_datetime_format=True)
+        if parsed.notna().mean() >= 0.8:
+            df[col] = parsed
+            datetime_columns.append(col)
+
+    for col in df.select_dtypes(include="object").columns:
+        if col in datetime_columns:
+            continue
+        coerced = pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
+        if coerced.notna().mean() >= 0.8:
+            df[col] = coerced
+
+    return df, datetime_columns
+
+@st.cache_data
+def get_quality_report(df: pd.DataFrame):
+    total_rows = len(df)
+    missing_counts = df.isna().sum()
+    missing_pct = (missing_counts / total_rows * 100).round(1)
+    empty_strings = (
+        df.select_dtypes(include="object")
+        .apply(lambda col: col.astype(str).str.strip().eq("").sum())
+    )
+    duplicated = df.duplicated().sum()
+
+    missing_report = pd.DataFrame({
+        "missing_count": missing_counts,
+        "missing_pct": missing_pct,
+        "empty_strings": empty_strings,
+    }).sort_values("missing_pct", ascending=False)
+
+    return {
+        "total_rows": total_rows,
+        "total_columns": df.shape[1],
+        "missing_total": int(missing_counts.sum()),
+        "missing_report": missing_report,
+        "duplicate_rows": int(duplicated),
+    }
+
+def format_prompt_summary(df: pd.DataFrame):
+    summary = df.describe(include="all").round(3).to_string()
+    sample = df.head(10).to_string()
+    return summary, sample
+
+def query_ai(prompt: str, max_tokens: int = 800):
+    try:
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content
+    except Exception as error:
+        return f"Error generating AI response: {error}"
+
+uploaded_file = st.file_uploader("Upload your CSV file", type="csv")
+
+if uploaded_file:
+    try:
+        raw_df = load_csv(uploaded_file)
+    except Exception as error:
+        st.error(f"Could not read the CSV file: {error}")
+        st.stop()
+
+    if raw_df.empty:
+        st.warning("The uploaded file is empty. Please upload a valid CSV file.")
+        st.stop()
+
+    st.success(f"✅ File uploaded: {uploaded_file.name} — {raw_df.shape[0]} rows, {raw_df.shape[1]} columns")
+
+    with st.expander("🔍 Preview raw data"):
+        st.dataframe(raw_df.head(20))
+
+    df, datetime_columns = preprocess_data(raw_df)
+    quality = get_quality_report(df)
+    num_cols = df.select_dtypes(include="number").columns.tolist()
+    cat_cols = df.select_dtypes(include="object").columns.tolist()
+
+    st.subheader("📈 Quick Stats")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Rows", f"{quality['total_rows']:,}")
+    col2.metric("Total Columns", quality["total_columns"])
+    col3.metric("Numeric Columns", len(num_cols))
+    col4.metric("Missing Values", quality["missing_total"])
+
+    st.subheader("🧹 Data Quality Summary")
+    dq_col1, dq_col2, dq_col3 = st.columns(3)
+    dq_col1.metric("Duplicate rows", quality["duplicate_rows"])
+    dq_col2.metric("Datetime columns", len(datetime_columns))
+    top_missing = quality["missing_report"].head(3)
+    dq_col3.write("**Top missing columns**")
+    dq_col3.table(top_missing[["missing_count", "missing_pct", "empty_strings"]])
+
+    if quality["missing_report"].iloc[0]["missing_pct"] >= 50:
+        st.warning("More than half of at least one column is missing. Consider cleaning or dropping those columns before analysis.")
+
+    st.sidebar.header("Data Filters")
+    filtered_df = df
+
+    if datetime_columns:
+        date_col = st.sidebar.selectbox("Filter by date column", [None] + datetime_columns)
+        if date_col:
+            min_date = filtered_df[date_col].min()
+            max_date = filtered_df[date_col].max()
+            selected_range = st.sidebar.date_input("Date range", [min_date.date(), max_date.date()])
+            if len(selected_range) == 2:
+                start_date, end_date = selected_range
+                filtered_df = filtered_df[filtered_df[date_col].between(pd.to_datetime(start_date), pd.to_datetime(end_date))]
+
+    if cat_cols:
+        cat_col = st.sidebar.selectbox("Filter by category column", [None] + cat_cols)
+        if cat_col:
+            choices = filtered_df[cat_col].dropna().unique().tolist()
+            selected_values = st.sidebar.multiselect(f"Select {cat_col}", choices, default=choices[:5])
+            if selected_values:
+                filtered_df = filtered_df[filtered_df[cat_col].isin(selected_values)]
+
+    if filtered_df.empty:
+        st.warning("No rows remain after filtering. Adjust filters to see charts and AI insights.")
+    else:
+        with st.expander("🔎 Preview filtered data"):
+            st.dataframe(filtered_df.head(20))
+
+        st.subheader("📊 Auto-Generated Charts")
+        chart_col1, chart_col2 = st.columns(2)
+
+        if num_cols:
+            with chart_col1:
+                selected_num = st.selectbox("Select numeric column for distribution", num_cols)
+                fig1 = px.histogram(filtered_df, x=selected_num, nbins=30,
+                                    title=f"Distribution of {selected_num}",
+                                    color_discrete_sequence=["#378ADD"])
+                fig1.update_layout(bargap=0.1)
+                st.plotly_chart(fig1, use_container_width=True)
+
+        if cat_cols and num_cols:
+            with chart_col2:
+                selected_cat = st.selectbox("Select category column", cat_cols)
+                selected_val = st.selectbox("Select value column", num_cols)
+                grouped = (
+                    filtered_df.groupby(selected_cat)[selected_val]
+                    .sum()
+                    .reset_index()
+                    .sort_values(selected_val, ascending=False)
+                    .head(10)
+                )
+                fig2 = px.bar(grouped, x=selected_cat, y=selected_val,
+                              title=f"{selected_val} by {selected_cat}",
+                              color=selected_val,
+                              color_continuous_scale="Blues")
+                st.plotly_chart(fig2, use_container_width=True)
+
+        if len(num_cols) >= 2:
+            st.subheader("🔗 Correlation Between Numeric Columns")
+            corr = filtered_df[num_cols].corr().round(2)
+            fig3 = px.imshow(corr, text_auto=True, color_continuous_scale="RdBu",
+                             title="Correlation Heatmap")
+            st.plotly_chart(fig3, use_container_width=True)
+
+        st.subheader("🤖 AI Insights")
+        if st.button("Generate AI Insights"):
+            with st.spinner("Analyzing your data..."):
+                summary, sample = format_prompt_summary(filtered_df)
+                prompt = f"""
+You are a smart data analyst. Analyze the following dataset and provide:
+
+1. A brief overview of what this dataset seems to be about
+2. 3 key trends or patterns you notice
+3. 2 data quality issues or anomalies in the data
+4. 3 actionable business suggestions based on the data
+
+Data quality notes:
+- Total rows: {quality['total_rows']}
+- Total columns: {quality['total_columns']}
+- Duplicate rows: {quality['duplicate_rows']}
+- Top missing columns:
+{top_missing.to_string(index=True)}
+
+Dataset summary statistics:
+{summary}
+
+Sample rows:
+{sample}
+
+Write in simple, clear language. Use bullet points. Be specific with numbers where possible.
+"""
+                insights = query_ai(prompt, max_tokens=1000)
+                st.markdown(insights)
+
+        st.subheader("💬 Ask AI About Your Data")
+        question = st.text_input("Ask any question about your dataset",
+                                  placeholder="e.g. Which category has the highest revenue?")
+
+        if question:
+            with st.spinner("Thinking..."):
+                summary, sample = format_prompt_summary(filtered_df)
+                prompt = f"""
+You are a data analyst. Here is a filtered dataset:
+
+Sample data:
+{sample}
+
+Summary statistics:
+{summary}
+
+Answer this question clearly and concisely: {question}
+
+Use specific numbers from the data wherever possible.
+"""
+                answer = query_ai(prompt, max_tokens=800)
+                st.write("**Answer:**", answer)
+
+else:
+    st.info("⬆️ Upload a CSV file to get started. Works with any data — sales, expenses, marks, surveys, etc.")
+    st.markdown("""
+    **Example CSVs you can try:**
+    - Download any dataset from [Kaggle.com](https://www.kaggle.com/datasets) (free)
+    - Export your Excel sheet as CSV
+    - Use any sample CSV from Google
+    """)
